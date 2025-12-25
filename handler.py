@@ -108,7 +108,6 @@ def load_models():
         print(f"✅ Downloaded weights to {MODEL_DIR}")
 
     print(f"⏳ Loading Lucy-Edit from {MODEL_DIR}...")
-    start_time = time.time()
     vae = AutoencoderKLWan.from_pretrained(MODEL_DIR, subfolder="vae", torch_dtype=torch.float32)
     pipe = LucyEditPipeline.from_pretrained(MODEL_DIR, vae=vae, torch_dtype=torch.bfloat16)
     pipe.to(device)
@@ -130,7 +129,6 @@ def load_models():
     except Exception as e:
         print(f"⚠️ Upscaler failed: {e}")
         upscaler = None
-    print(f"✅ Setup complete in {time.time() - start_time:.2f}s")
 
 def download_video(url, dest_path):
     print(f"⬇️ Downloading: {url}")
@@ -151,14 +149,31 @@ def process_segment(video_frames, prompt, negative_prompt, inf_w, inf_h, guidanc
         ).frames[0]
     return output_frames
 
-# --- HEALTH CHECK ENDPOINT ---
-@app.route('/ping', methods=['GET'])
-def ping():
-    return jsonify({"status": "healthy", "model_loaded": pipe is not None})
+# --- STARTUP LOGIC ---
+model_loading_status = "idle"
+loading_error = None
 
+def model_loader_thread():
+    global pipe, upscaler, model_loading_status, loading_error
+    try:
+        model_loading_status = "loading"
+        load_models()
+        model_loading_status = "ready"
+        print("✅ Models ready - Background loading complete!")
+    except Exception as e:
+        print(f"❌ Critical Error loading models: {e}")
+        model_loading_status = "error"
+        loading_error = str(e)
+
+# --- HEALTH CHECK ENDPOINTS ---
+@app.route('/ping', methods=['GET'])
 @app.route('/health', methods=['GET'])
-def health():
-    return jsonify({"status": "healthy", "model_loaded": pipe is not None})
+def ping():
+    return jsonify({
+        "status": "healthy" if model_loading_status == "ready" else "initializing",
+        "model_status": model_loading_status,
+        "error": loading_error
+    })
 
 # --- MAIN INFERENCE ENDPOINT ---
 @app.route('/', methods=['POST'])
@@ -167,9 +182,12 @@ def health():
 def generate():
     global pipe, upscaler
     
+    if model_loading_status != "ready":
+        return jsonify({"error": "Model is still loading, please wait", "status": model_loading_status}), 503
+
     try:
         data = request.get_json()
-        job_input = data.get("input", data)  # Support both {input: {...}} and direct {...}
+        job_input = data.get("input", data)
         
         prompt = job_input.get("prompt")
         video_url = job_input.get("video_url")
@@ -185,7 +203,6 @@ def generate():
         if not video_url or not prompt:
             return jsonify({"error": "Missing 'video_url' or 'prompt'"}), 400
 
-        # Download video
         import uuid
         job_id = str(uuid.uuid4())[:8]
         temp_in = f"/tmp/{job_id}_in.mp4"
@@ -193,7 +210,6 @@ def generate():
         video = load_video(temp_in)
         total_input_frames = len(video)
 
-        # Calculate target frames
         if target_duration == 10:
             target_frames = min(total_input_frames, 240)
         elif target_duration == 5:
@@ -202,16 +218,12 @@ def generate():
             target_frames = min(total_input_frames, MAX_FRAMES_PER_PASS)
         video = video[:target_frames]
 
-        # Aspect ratio
         orig_w, orig_h = video[0].size
         inf_w, inf_h = width, height
         if orig_h > orig_w:
             inf_w, inf_h = min(width, height), max(width, height)
         video = [frame.resize((inf_w, inf_h)) for frame in video]
 
-        print(f"🎨 Processing {len(video)} frames with prompt: {prompt}")
-
-        # Single or two-pass
         if len(video) <= MAX_FRAMES_PER_PASS:
             all_output_frames = process_segment(video, prompt, negative_prompt, inf_w, inf_h, guidance_scale, num_inference_steps, seed)
         else:
@@ -219,10 +231,8 @@ def generate():
             overlap = 5
             segment1 = video[:mid + overlap]
             segment2 = video[mid - overlap:]
-            print(f"📽️ Two-pass: segment1={len(segment1)}, segment2={len(segment2)}")
             output1 = process_segment(segment1, prompt, negative_prompt, inf_w, inf_h, guidance_scale, num_inference_steps, seed)
             output2 = process_segment(segment2, prompt, negative_prompt, inf_w, inf_h, guidance_scale, num_inference_steps, seed)
-            # Blend overlap
             blend_start = len(output1) - overlap
             blended_overlap = []
             for i in range(overlap):
@@ -233,10 +243,8 @@ def generate():
                 blended_overlap.append(Image.fromarray(blended))
             all_output_frames = output1[:blend_start] + blended_overlap + output2[overlap:]
 
-        # Upscaling
         final_w, final_h = inf_w, inf_h
         if upscale_to_1080p:
-            print("✨ Upscaling...")
             tgt_w, tgt_h = (1920, 1080) if inf_w > inf_h else (1080, 1920)
             final_w, final_h = tgt_w, tgt_h
             if upscaler:
@@ -251,7 +259,6 @@ def generate():
             else:
                 all_output_frames = [f.resize((tgt_w, tgt_h), Image.LANCZOS) for f in all_output_frames]
 
-        # Save and encode
         temp_out = f"/tmp/{job_id}_out.mp4"
         export_to_video(all_output_frames, temp_out, fps=FPS)
         with open(temp_out, 'rb') as f:
@@ -259,7 +266,6 @@ def generate():
         os.remove(temp_in)
         os.remove(temp_out)
 
-        print(f"✅ Job complete: {len(all_output_frames)} frames")
         return jsonify({
             "status": "success",
             "video_base64": video_base64,
@@ -274,28 +280,24 @@ def generate():
 # --- STARTUP ---
 if __name__ == "__main__":
     print("🚀 TurboLucy HTTP Server Starting...")
-    load_models()
+    threading.Thread(target=model_loader_thread, daemon=True).start()
     
-    # Get ports from environment
     port = int(os.environ.get("PORT", 8000))
     health_port = int(os.environ.get("PORT_HEALTH", port))
     
-    print(f"✅ Ready! Serving Main on port {port}")
+    print(f"✅ Web Server starting on port {port}")
     
     if health_port != port:
-        print(f"🏥 Starting Health Check server on port {health_port}")
-        # Run health check server in a separate thread
+        print(f"🏥 Starting dedicated Health server on port {health_port}")
         from flask import Flask as HealthFlask
         health_app = HealthFlask("health")
         @health_app.route('/ping')
         @health_app.route('/health')
-        def health_ping():
-            return {"status": "healthy", "model_loaded": pipe is not None}
-        
-        def run_health():
-            health_app.run(host="0.0.0.0", port=health_port)
-        
-        threading.Thread(target=run_health, daemon=True).start()
+        def h_ping():
+            return jsonify({
+                "status": "healthy" if model_loading_status == "ready" else "initializing",
+                "model_status": model_loading_status
+            })
+        threading.Thread(target=lambda: health_app.run(host="0.0.0.0", port=health_port), daemon=True).start()
 
-    # Run Main Flask with threading for concurrent requests
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    app.run(host="0.0.0.0", port=port, threaded=True, debug=False)
