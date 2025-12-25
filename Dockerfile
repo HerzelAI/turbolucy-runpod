@@ -11,7 +11,7 @@ RUN pip install --upgrade pip setuptools && \
     pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu126
 
 # A. Frameworks and Core
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir --ignore-installed \
     diffusers>=0.30.0 \
     transformers \
     accelerate \
