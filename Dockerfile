@@ -45,7 +45,7 @@ RUN wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/reale
 
 # 4. Copy Handler
 WORKDIR /app
-COPY handler.py /app/handler.py
+COPY handler.py processing.py /app/
 
 # 5. Start
 CMD [ "python", "-u", "/app/handler.py" ]
