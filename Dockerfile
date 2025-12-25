@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir --ignore-installed \
     transformers \
     accelerate \
     huggingface_hub \
-    runpod \
+    runpod==1.7.10 \
     imageio \
     imageio-ffmpeg \
     scipy \
