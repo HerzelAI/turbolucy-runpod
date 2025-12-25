@@ -276,11 +276,26 @@ if __name__ == "__main__":
     print("🚀 TurboLucy HTTP Server Starting...")
     load_models()
     
-    # Get port from environment (RunPod sets PORT)
+    # Get ports from environment
     port = int(os.environ.get("PORT", 8000))
     health_port = int(os.environ.get("PORT_HEALTH", port))
     
-    print(f"✅ Ready! Serving on port {port}")
+    print(f"✅ Ready! Serving Main on port {port}")
     
-    # Run Flask with threading for concurrent requests
+    if health_port != port:
+        print(f"🏥 Starting Health Check server on port {health_port}")
+        # Run health check server in a separate thread
+        from flask import Flask as HealthFlask
+        health_app = HealthFlask("health")
+        @health_app.route('/ping')
+        @health_app.route('/health')
+        def health_ping():
+            return {"status": "healthy", "model_loaded": pipe is not None}
+        
+        def run_health():
+            health_app.run(host="0.0.0.0", port=health_port)
+        
+        threading.Thread(target=run_health, daemon=True).start()
+
+    # Run Main Flask with threading for concurrent requests
     app.run(host="0.0.0.0", port=port, threaded=True)
