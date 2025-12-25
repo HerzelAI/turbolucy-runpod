@@ -1,16 +1,15 @@
-import runpod
 import torch
 import os
 import sys
 import time
 import base64
 import requests
-import tempfile
 import numpy as np
-import cv2
 from PIL import Image
+from flask import Flask, request, jsonify
 from diffusers import AutoencoderKLWan, LucyEditPipeline
 from diffusers.utils import export_to_video, load_video
+import threading
 
 # --- GLOBAL PATCHES ---
 _original_sdpa = torch.nn.functional.scaled_dot_product_attention
@@ -96,6 +95,9 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 FPS = 24
 MAX_FRAMES_PER_PASS = 120
 
+# Flask app
+app = Flask(__name__)
+
 def load_models():
     global pipe, upscaler, MODEL_DIR
     if MODEL_DIR is None:
@@ -149,110 +151,136 @@ def process_segment(video_frames, prompt, negative_prompt, inf_w, inf_h, guidanc
         ).frames[0]
     return output_frames
 
-def handler(job):
-    """Synchronous handler - most reliable for RunPod queue."""
+# --- HEALTH CHECK ENDPOINT ---
+@app.route('/ping', methods=['GET'])
+def ping():
+    return jsonify({"status": "healthy", "model_loaded": pipe is not None})
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "healthy", "model_loaded": pipe is not None})
+
+# --- MAIN INFERENCE ENDPOINT ---
+@app.route('/', methods=['POST'])
+@app.route('/run', methods=['POST'])
+@app.route('/generate', methods=['POST'])
+def generate():
     global pipe, upscaler
     
-    print(f"📥 Job received: {job['id']}")
-    job_input = job["input"]
+    try:
+        data = request.get_json()
+        job_input = data.get("input", data)  # Support both {input: {...}} and direct {...}
+        
+        prompt = job_input.get("prompt")
+        video_url = job_input.get("video_url")
+        negative_prompt = job_input.get("negative_prompt", "")
+        height = job_input.get("height", 480)
+        width = job_input.get("width", 832)
+        guidance_scale = job_input.get("guidance_scale", 5.0)
+        num_inference_steps = job_input.get("num_inference_steps", 8)
+        seed = job_input.get("seed", 42)
+        upscale_to_1080p = job_input.get("upscale_to_1080p", False)
+        target_duration = job_input.get("target_duration", "auto")
 
-    prompt = job_input.get("prompt")
-    video_url = job_input.get("video_url")
-    negative_prompt = job_input.get("negative_prompt", "")
-    height = job_input.get("height", 480)
-    width = job_input.get("width", 832)
-    guidance_scale = job_input.get("guidance_scale", 5.0)
-    num_inference_steps = job_input.get("num_inference_steps", 8)
-    seed = job_input.get("seed", 42)
-    upscale_to_1080p = job_input.get("upscale_to_1080p", False)
-    target_duration = job_input.get("target_duration", "auto")
+        if not video_url or not prompt:
+            return jsonify({"error": "Missing 'video_url' or 'prompt'"}), 400
 
-    if not video_url or not prompt:
-        return {"error": "Missing 'video_url' or 'prompt'"}
+        # Download video
+        import uuid
+        job_id = str(uuid.uuid4())[:8]
+        temp_in = f"/tmp/{job_id}_in.mp4"
+        download_video(video_url, temp_in)
+        video = load_video(temp_in)
+        total_input_frames = len(video)
 
-    # Download video
-    temp_in = f"/tmp/{job['id']}_in.mp4"
-    download_video(video_url, temp_in)
-    video = load_video(temp_in)
-    total_input_frames = len(video)
-
-    # Calculate target frames
-    if target_duration == 10:
-        target_frames = min(total_input_frames, 240)
-    elif target_duration == 5:
-        target_frames = min(total_input_frames, 120)
-    else:
-        target_frames = min(total_input_frames, MAX_FRAMES_PER_PASS)
-    video = video[:target_frames]
-
-    # Aspect ratio
-    orig_w, orig_h = video[0].size
-    inf_w, inf_h = width, height
-    if orig_h > orig_w:
-        inf_w, inf_h = min(width, height), max(width, height)
-    video = [frame.resize((inf_w, inf_h)) for frame in video]
-
-    print(f"🎨 Processing {len(video)} frames with prompt: {prompt}")
-
-    # Single or two-pass
-    if len(video) <= MAX_FRAMES_PER_PASS:
-        all_output_frames = process_segment(video, prompt, negative_prompt, inf_w, inf_h, guidance_scale, num_inference_steps, seed)
-    else:
-        mid = len(video) // 2
-        overlap = 5
-        segment1 = video[:mid + overlap]
-        segment2 = video[mid - overlap:]
-        print(f"📽️ Two-pass: segment1={len(segment1)}, segment2={len(segment2)}")
-        output1 = process_segment(segment1, prompt, negative_prompt, inf_w, inf_h, guidance_scale, num_inference_steps, seed)
-        output2 = process_segment(segment2, prompt, negative_prompt, inf_w, inf_h, guidance_scale, num_inference_steps, seed)
-        # Blend overlap
-        blend_start = len(output1) - overlap
-        blended_overlap = []
-        for i in range(overlap):
-            alpha = i / overlap
-            frame1 = np.array(output1[blend_start + i])
-            frame2 = np.array(output2[i])
-            blended = ((1 - alpha) * frame1 + alpha * frame2).astype(np.uint8)
-            blended_overlap.append(Image.fromarray(blended))
-        all_output_frames = output1[:blend_start] + blended_overlap + output2[overlap:]
-
-    # Upscaling
-    final_w, final_h = inf_w, inf_h
-    if upscale_to_1080p:
-        print("✨ Upscaling...")
-        tgt_w, tgt_h = (1920, 1080) if inf_w > inf_h else (1080, 1920)
-        final_w, final_h = tgt_w, tgt_h
-        if upscaler:
-            upscaled = []
-            for frame in all_output_frames:
-                try:
-                    res, _ = upscaler.enhance(np.array(frame), outscale=2)
-                    upscaled.append(Image.fromarray(res).resize((tgt_w, tgt_h), Image.LANCZOS))
-                except:
-                    upscaled.append(frame.resize((tgt_w, tgt_h), Image.LANCZOS))
-            all_output_frames = upscaled
+        # Calculate target frames
+        if target_duration == 10:
+            target_frames = min(total_input_frames, 240)
+        elif target_duration == 5:
+            target_frames = min(total_input_frames, 120)
         else:
-            all_output_frames = [f.resize((tgt_w, tgt_h), Image.LANCZOS) for f in all_output_frames]
+            target_frames = min(total_input_frames, MAX_FRAMES_PER_PASS)
+        video = video[:target_frames]
 
-    # Save and encode
-    temp_out = f"/tmp/{job['id']}_out.mp4"
-    export_to_video(all_output_frames, temp_out, fps=FPS)
-    with open(temp_out, 'rb') as f:
-        video_base64 = base64.b64encode(f.read()).decode('utf-8')
-    os.remove(temp_in)
-    os.remove(temp_out)
+        # Aspect ratio
+        orig_w, orig_h = video[0].size
+        inf_w, inf_h = width, height
+        if orig_h > orig_w:
+            inf_w, inf_h = min(width, height), max(width, height)
+        video = [frame.resize((inf_w, inf_h)) for frame in video]
 
-    print(f"✅ Job {job['id']} complete: {len(all_output_frames)} frames")
-    return {
-        "status": "success",
-        "video_base64": video_base64,
-        "resolution": f"{final_w}x{final_h}",
-        "frames": len(all_output_frames),
-        "duration_seconds": len(all_output_frames) / FPS
-    }
+        print(f"🎨 Processing {len(video)} frames with prompt: {prompt}")
+
+        # Single or two-pass
+        if len(video) <= MAX_FRAMES_PER_PASS:
+            all_output_frames = process_segment(video, prompt, negative_prompt, inf_w, inf_h, guidance_scale, num_inference_steps, seed)
+        else:
+            mid = len(video) // 2
+            overlap = 5
+            segment1 = video[:mid + overlap]
+            segment2 = video[mid - overlap:]
+            print(f"📽️ Two-pass: segment1={len(segment1)}, segment2={len(segment2)}")
+            output1 = process_segment(segment1, prompt, negative_prompt, inf_w, inf_h, guidance_scale, num_inference_steps, seed)
+            output2 = process_segment(segment2, prompt, negative_prompt, inf_w, inf_h, guidance_scale, num_inference_steps, seed)
+            # Blend overlap
+            blend_start = len(output1) - overlap
+            blended_overlap = []
+            for i in range(overlap):
+                alpha = i / overlap
+                frame1 = np.array(output1[blend_start + i])
+                frame2 = np.array(output2[i])
+                blended = ((1 - alpha) * frame1 + alpha * frame2).astype(np.uint8)
+                blended_overlap.append(Image.fromarray(blended))
+            all_output_frames = output1[:blend_start] + blended_overlap + output2[overlap:]
+
+        # Upscaling
+        final_w, final_h = inf_w, inf_h
+        if upscale_to_1080p:
+            print("✨ Upscaling...")
+            tgt_w, tgt_h = (1920, 1080) if inf_w > inf_h else (1080, 1920)
+            final_w, final_h = tgt_w, tgt_h
+            if upscaler:
+                upscaled = []
+                for frame in all_output_frames:
+                    try:
+                        res, _ = upscaler.enhance(np.array(frame), outscale=2)
+                        upscaled.append(Image.fromarray(res).resize((tgt_w, tgt_h), Image.LANCZOS))
+                    except:
+                        upscaled.append(frame.resize((tgt_w, tgt_h), Image.LANCZOS))
+                all_output_frames = upscaled
+            else:
+                all_output_frames = [f.resize((tgt_w, tgt_h), Image.LANCZOS) for f in all_output_frames]
+
+        # Save and encode
+        temp_out = f"/tmp/{job_id}_out.mp4"
+        export_to_video(all_output_frames, temp_out, fps=FPS)
+        with open(temp_out, 'rb') as f:
+            video_base64 = base64.b64encode(f.read()).decode('utf-8')
+        os.remove(temp_in)
+        os.remove(temp_out)
+
+        print(f"✅ Job complete: {len(all_output_frames)} frames")
+        return jsonify({
+            "status": "success",
+            "video_base64": video_base64,
+            "resolution": f"{final_w}x{final_h}",
+            "frames": len(all_output_frames),
+            "duration_seconds": len(all_output_frames) / FPS
+        })
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 # --- STARTUP ---
-print("🚀 TurboLucy Starting...")
-load_models()
-print("✅ Ready to accept jobs!")
-runpod.serverless.start({"handler": handler})
+if __name__ == "__main__":
+    print("🚀 TurboLucy HTTP Server Starting...")
+    load_models()
+    
+    # Get port from environment (RunPod sets PORT)
+    port = int(os.environ.get("PORT", 8000))
+    health_port = int(os.environ.get("PORT_HEALTH", port))
+    
+    print(f"✅ Ready! Serving on port {port}")
+    
+    # Run Flask with threading for concurrent requests
+    app.run(host="0.0.0.0", port=port, threaded=True)

@@ -17,6 +17,7 @@ RUN pip install --no-cache-dir \
     accelerate \
     huggingface_hub \
     runpod \
+    flask \
     imageio \
     imageio-ffmpeg \
     scipy \
