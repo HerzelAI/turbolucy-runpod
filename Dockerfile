@@ -1,5 +1,5 @@
 # Use RunPod base with CUDA 12.4 (supports newer GPUs)
-FROM runpod/pytorch:2.5.1-py3.11-cuda12.4.1-devel-ubuntu22.04
+FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 
 # 1. System Dependencies
 RUN apt-get update && apt-get install -y git ffmpeg wget libgl1-mesa-glx libglib2.0-0 && rm -rf /var/lib/apt/lists/*
