@@ -17,7 +17,6 @@ RUN pip install --no-cache-dir --ignore-installed \
     accelerate \
     huggingface_hub \
     runpod \
-    flask \
     imageio \
     imageio-ffmpeg \
     scipy \
@@ -45,7 +44,7 @@ RUN wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/reale
 
 # 4. Copy Handler
 WORKDIR /app
-COPY handler.py processing.py /app/
+COPY handler.py /app/handler.py
 
 # 5. Start
 CMD [ "python", "-u", "/app/handler.py" ]
